@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2020 the original author or authors.
+ * Copyright 2015-2019 the original author or authors.
  *
  * All rights reserved. This program and the accompanying materials are
  * made available under the terms of the Eclipse Public License v2.0 which
@@ -11,11 +11,14 @@
 package org.junit.jupiter.api;
 
 import static java.util.Comparator.comparingInt;
+import static java.util.stream.Collectors.toMap;
 import static org.apiguardian.api.API.Status.EXPERIMENTAL;
 
 import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 
 import org.apiguardian.api.API;
@@ -134,42 +137,15 @@ public interface MethodOrderer {
 	}
 
 	/**
-	 * {@code MethodOrderer} that sorts methods alphanumerically based on their
-	 * display names using {@link String#compareTo(String)}
-	 *
-	 * @since 5.7
-	 */
-	@API(status = EXPERIMENTAL, since = "5.7")
-	class DisplayName implements MethodOrderer {
-
-		/**
-		 * Sort the methods encapsulated in the supplied
-		 * {@link MethodOrdererContext} alphanumerically based on their display
-		 * names.
-		 */
-		@Override
-		public void orderMethods(MethodOrdererContext context) {
-			context.getMethodDescriptors().sort(comparator);
-		}
-
-		private static final Comparator<MethodDescriptor> comparator = Comparator.comparing(
-			MethodDescriptor::getDisplayName);
-	}
-
-	/**
 	 * {@code MethodOrderer} that sorts methods based on the {@link Order @Order}
 	 * annotation.
 	 *
 	 * <p>Any methods that are assigned the same order value will be sorted
 	 * arbitrarily adjacent to each other.
 	 *
-	 * <p>Any methods not annotated with {@code @Order} will be assigned the
-	 * {@link org.junit.jupiter.api.Order#DEFAULT default order} value which will
-	 * effectively cause them to appear at the end of the sorted list, unless
-	 * certain methods are assigned an explicit order value greater than the default
-	 * order value. Any methods assigned an explicit order value greater than the
-	 * default order value will appear after non-annotated methods in the sorted
-	 * list.
+	 * <p>Any methods not annotated with {@code @Order} will be assigned a default
+	 * order value of {@link Integer#MAX_VALUE} which will effectively cause them to
+	 * appear at the end of the sorted list.
 	 */
 	class OrderAnnotation implements MethodOrderer {
 
@@ -184,7 +160,77 @@ public interface MethodOrderer {
 		}
 
 		private static int getOrder(MethodDescriptor descriptor) {
-			return descriptor.findAnnotation(Order.class).map(Order::value).orElse(Order.DEFAULT);
+			return descriptor.findAnnotation(Order.class).map(Order::value).orElse(Integer.MAX_VALUE);
+		}
+	}
+
+	/**
+	 * {@code MethodOrderer} that sorts methods based on the {@link DependsOn @DependsOn}
+	 * annotation.
+	 *
+	 * @see  DependsOn
+	 */
+	class DependsOnAnnotation implements MethodOrderer {
+		private static final Logger logger = LoggerFactory.getLogger(Random.class);
+		// default value = 0 to make independent test run first, give it MAX_INT to make it run last
+		// Consider making this public, but not see any serious need yet
+		private static final int INDEPENDENT_TEST_PRIORITY = 0;
+
+		@Override
+		public void orderMethods(MethodOrdererContext context) {
+			// Directed Acyclic Graph (DAG) to represent order relationship between methods
+			// An edge from A -> B means method A should run after B
+			Map<String, String[]> digraph = context.getMethodDescriptors().stream().filter(
+				descriptor -> descriptor.isAnnotated(DependsOn.class)).collect(
+					toMap(descriptor -> descriptor.getMethod().getName(),
+						descriptor -> descriptor.findAnnotation(DependsOn.class).map(DependsOn::value).get()));
+
+			// Give each an @Order's value equivalent to its number of previous dependencies
+			Map<String, Integer> dependencySize = new HashMap<>();
+
+			try {
+				// run depth first search through all vertexes (methods) in graph to find dependencies
+				digraph.keySet().forEach(name -> depthFirstSearch(name, digraph, dependencySize));
+			}
+			catch (IllegalArgumentException exception) {
+				// cannot throw an exception here since MethodOrderer is not supposed to throw exception
+				logger.error(exception,
+					() -> "ERROR - Some arguments from @DependsOn annotations form cyclic dependencies, which would cause undefined behavior!");
+			}
+
+			context.getMethodDescriptors().sort(
+				Comparator.comparing(descriptor -> dependencySize.getOrDefault(descriptor.getMethod().getName(),
+					INDEPENDENT_TEST_PRIORITY)));
+		}
+
+		/**
+		 * This method will compute the (number of methods that must be run before the annotated method) + 1 (+1 to simplify computation)
+		 */
+		private int depthFirstSearch(String name, Map<String, String[]> digraph, Map<String, Integer> dependencySize) {
+			if (dependencySize.containsKey(name)) {
+				return dependencySize.get(name);
+			}
+			// mark entering this node
+			dependencySize.put(name, -1);
+
+			String[] ancestors = digraph.get(name);
+			int total = 1;
+
+			if (ancestors != null) {
+				for (String ancestor : ancestors) {
+					int sz = depthFirstSearch(ancestor, digraph, dependencySize);
+					// cycle detected, -1 means in process but not yet finished -> should not appear
+					if (sz == -1) {
+						throw new IllegalArgumentException(
+							String.format("Cycle detected between %s and %s", name, ancestor));
+					}
+					total += sz;
+				}
+			}
+
+			// update with correct value
+			dependencySize.put(name, total);
+			return total;
 		}
 	}
 
@@ -196,7 +242,7 @@ public interface MethodOrderer {
 	 * <p>By default, the random <em>seed</em> used for ordering methods is the
 	 * value returned by {@link System#nanoTime()} during static initialization
 	 * of this class. In order to support repeatable builds, the value of the
-	 * default random seed is logged at {@code INFO} level. In addition, a
+	 * default random seed is logged at {@code CONFIG} level. In addition, a
 	 * custom seed (potentially the default seed from the previous test plan
 	 * execution) may be specified via the {@link Random#RANDOM_SEED_PROPERTY_NAME
 	 * junit.jupiter.execution.order.random.seed} <em>configuration parameter</em>
@@ -220,7 +266,7 @@ public interface MethodOrderer {
 
 		static {
 			DEFAULT_SEED = System.nanoTime();
-			logger.info(() -> "MethodOrderer.Random default seed: " + DEFAULT_SEED);
+			logger.config(() -> "MethodOrderer.Random default seed: " + DEFAULT_SEED);
 		}
 
 		/**
